@@ -48,8 +48,6 @@ If you find any bugs or unexpected behavior, please [open an issue](../../issues
 | `ClassIdDesktop` | `lintClassId` for desktops in `tblNode` | `5` |
 | `ClassIdNotebook` | `lintClassId` for notebooks in `tblNode` | `47` |
 
-> **Note:** `ClassIdDesktop` and `ClassIdNotebook` values will almost certainly differ in your environment. Check your `tblNode` table or Alvao class definitions.
-
 ## How it works
 
 1. Calls `/managed/devices` (with pagination) and `/devices` to get all TeamViewer devices.

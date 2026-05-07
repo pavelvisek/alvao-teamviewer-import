@@ -6,15 +6,15 @@ Alvao Asset Management custom app that automatically syncs TeamViewer IDs to com
 
 A periodic action that pulls devices from TeamViewer (both the managed device list and the legacy one) and matches them to Alvao computer objects (desktops & notebooks) by hostname. If it finds a match, it writes the TeamViewer ID into a custom property.
 
-When there are duplicate hostnames on the TeamViewer side, the device with the most recent `last_seen` wins.
+When there are duplicate hostnames on the TeamViewer side, the script now uses smart matching: it prefers devices that are currently **Online**, then looks at the most recent `last_seen` date, and prioritizes **Managed** devices over Legacy ones. It also normalizes device names (stripping domains and suffixes like " - user").
 
 Works in our environment, but every Alvao setup is different — **please test thoroughly before using in production.**
 
 ## ⚠️ Test before production use
 
-**Please deploy this to a test/staging Alvao instance first** and run it with `DryRun = true` (which is the default). In DryRun mode it only logs what it *would* change without actually writing anything.
+**Please deploy this to a test/staging Alvao instance first.** The default setting for `DryRun` is now `false` (meaning it writes to the database immediately). We highly recommend temporarily changing it to `DryRun = true` in the script for your first run. In DryRun mode it only logs what it *would* change without actually writing anything.
 
-Check the Diagnostic Log, make sure the matches make sense for your environment, and only then flip `DryRun` to `false`.
+Check the Diagnostic Log, make sure the matches make sense for your environment, and only then flip `DryRun` back to `false`.
 
 If you find any bugs or unexpected behavior, please [open an issue](../../issues) — I've only been able to test this against our own setup, so feedback is very welcome.
 
@@ -41,8 +41,9 @@ If you find any bugs or unexpected behavior, please [open an issue](../../issues
 |---|---|---|
 | `ApiToken` | Your TeamViewer Web API bearer token | `YOUR-API-TOKEN-HERE` |
 | `ApiBase` | TeamViewer API base URL | `https://webapi.teamviewer.com/api/v1` |
-| `DryRun` | `true` = only log, don't write anything | `true` |
+| `DryRun` | `true` = only log, don't write anything | `false` |
 | `EnableLogging` | `true` = info messages in Diagnostic Log (errors are always logged) | `true` |
+| `EnableDetailedNotFoundLogging` | `true` = log detailed reasons for TV devices not matched in Alvao | `false` |
 | `RunAtHour` | Hour (0–23) to run, or `-1` for every periodic action cycle | `-1` |
 | `PropertyKey` | Name of the Alvao custom property to update | `TeamViewer ID` |
 | `ClassIdDesktop` | `lintClassId` for desktops in `tblNode` | `5` |
@@ -50,8 +51,8 @@ If you find any bugs or unexpected behavior, please [open an issue](../../issues
 
 ## How it works
 
-1. Calls `/managed/devices` (with pagination) and `/devices` to get all TeamViewer devices.
-2. Builds a hostname → TeamViewer ID map (strips domain part, case-insensitive comparison, most recent `last_seen` wins on duplicates).
+1. Calls `/managed/devices` (with pagination) and `/devices?full_list=true` to get all TeamViewer devices (including online state).
+2. Builds a hostname → TeamViewer ID map (normalizes names by stripping domain parts and suffixes like " - user", case-insensitive comparison, resolves duplicates by prioritizing Online > Last Seen > Managed source).
 3. Queries Alvao for non-discarded desktop/notebook objects that have a hostname.
 4. Compares and updates the custom property where the value changed.
 5. Logs a summary: updated / unchanged / not found / failed + elapsed time.

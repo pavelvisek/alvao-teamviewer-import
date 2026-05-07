@@ -2,49 +2,42 @@
 <AlvaoApplication xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema" ModelVersion="1">
   <Applications>
     <Application id="100">
-      <Name>TeamViewer ID Import v1.00</Name>
-      <Description>Synchronizes the TeamViewer ID on Alvao computer objects by matching on hostname against the TeamViewer tenant (both the managed and legacy device lists). When a hostname matches multiple TeamViewer devices, the most recently active one (newest last_seen) wins.
-
-The TeamViewer API token must have the following scopes: "Computers &amp; Contacts - view entries" and "Managed groups - read operations".
-
-Settings:
-- ApiToken: TeamViewer Web API bearer token.
-- ApiBase: Base URL of the TeamViewer Web API (default https://webapi.teamviewer.com/api/v1).
-- DryRun: When true, the sync only logs the changes it would make without writing anything; switch to false for real updates.
-- EnableLogging: When true, informational messages are written to the Diagnostic Log; errors are always logged regardless.
-- RunAtHour: Hour of day (0-23) at which the sync should run; set to -1 to run every time the periodic action fires.
-- PropertyKey: Name of the Alvao custom property to update (default "TeamViewer ID").
-- ClassIdDesktop / ClassIdNotebook: lintClassId values identifying desktop and notebook objects in tblNode.
-
-Recommended rollout: run with DryRun=true first, review the Diagnostic Log, then set DryRun=false.</Description>
+      <Name>TeamViewer ID Import</Name>
+      <Description>Imports TeamViewer IDs into Alvao by matching normalized hostname.</Description>
       <UniqueId>d8e9f3b2-1c4d-4e5f-9a8b-7c6d5e4f3a2b</UniqueId>
-      <Version>1</Version>
+      <Version>5</Version>
       <Scripts>
         <Script id="200">
           <Name>Settings</Name>
-          <Code>public static class Settings
+          <Code><![CDATA[
+public static class Settings
 {
-    public const string ApiToken = "";
+    public const string ApiToken = "SEM_DEJ_NOVY_TOKEN";
     public const string ApiBase = "https://webapi.teamviewer.com/api/v1";
 
-    public const bool DryRun = true;
+    public static readonly bool DryRun = false;
+    public static readonly bool EnableLogging = true;
 
-    public const bool EnableLogging = true;
-
+    // -1 = every run, otherwise hour 0-23
     public const int RunAtHour = -1;
 
     public const string PropertyKey = "TeamViewer ID";
 
-    public const int ClassIdDesktop = 5;
-    public const int ClassIdNotebook = 47;
-}</Code>
+    // Ověř podle reálných objektů v Alvao.
+    public const int ClassIdDesktop = 3;
+    public const int ClassIdNotebook = 145;
+
+    public static readonly bool EnableDetailedNotFoundLogging = false;
+}
+          ]]></Code>
           <IsLibCode>true</IsLibCode>
         </Script>
+
         <Script id="201">
           <Name>TeamViewerImportPeriodicAction</Name>
-          <Code>using System;
+          <Code><![CDATA[
+using System;
 using System.Collections.Generic;
-using System.Data;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -69,30 +62,40 @@ public class TeamViewerImportPeriodicAction : IPeriodicAction
     {
         var logger = Alvao.API.Internal.TenantDiagnosticsLog.Get();
 
-        int runAtHour = Settings.RunAtHour;
-        if (runAtHour &gt;= 0 &amp;&amp; DateTime.Now.Hour != runAtHour)
+        if (string.IsNullOrWhiteSpace(Settings.ApiToken))
+        {
+            logger.Error("TeamViewerImport: ApiToken is empty.");
+            return;
+        }
+
+        if (Settings.RunAtHour >= 0 && DateTime.Now.Hour != Settings.RunAtHour)
             return;
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        LogInfo(logger, "TeamViewerImport: Starting sync. DryRun=" + Settings.DryRun);
 
-        Dictionary&lt;string, TvDevice&gt; tvByHost;
+        LogInfo(logger, "Starting sync. DryRun=" + Settings.DryRun);
+
+        Dictionary<string, TvDevice> tvDevices;
+
         try
         {
-            tvByHost = LoadTeamViewerDevices(logger);
+            tvDevices = LoadTeamViewerDevices(logger);
         }
         catch (Exception ex)
         {
             logger.Error(ex, "TeamViewerImport: Failed to load TeamViewer devices: " + ex.Message);
             return;
         }
-        LogInfo(logger, "TeamViewerImport: Loaded " + tvByHost.Count + " unique TeamViewer devices (by hostname).");
 
-        List&lt;AlvaoComputer&gt; computers;
+        LogInfo(logger, "Loaded TeamViewer devices: " + tvDevices.Count);
+
+        List<AlvaoComputer> computers;
+
         using (var scope = AlvaoContext.GetConnectionScope())
         {
-            computers = scope.Connection.Query&lt;AlvaoComputer&gt;(@"
+            computers = scope.Connection.Query<AlvaoComputer>(@"
                 SELECT n.intNodeId AS NodeId,
+                       n.lintClassId AS ClassId,
                        nc.Hostname AS Hostname,
                        nc.TeamviewerId AS CurrentTeamviewerId
                 FROM tblNode n
@@ -101,158 +104,251 @@ public class TeamViewerImportPeriodicAction : IPeriodicAction
                   AND n.IsDiscarded = 0
                   AND n.IsRemoved = 0
                   AND nc.Hostname IS NOT NULL
-                  AND LTRIM(RTRIM(nc.Hostname)) &lt;&gt; ''",
-                new { desktopId = Settings.ClassIdDesktop, notebookId = Settings.ClassIdNotebook },
+                  AND LTRIM(RTRIM(nc.Hostname)) <> ''",
+                new
+                {
+                    desktopId = Settings.ClassIdDesktop,
+                    notebookId = Settings.ClassIdNotebook
+                },
                 scope.Transaction).ToList();
         }
-        LogInfo(logger, "TeamViewerImport: " + computers.Count + " Alvao computers to check.");
 
-        var systemPerson = Alvao.API.Common.Person.GetSystem();
-        bool dryRun = Settings.DryRun;
-        int updated = 0, unchanged = 0, notFound = 0, failed = 0;
+        LogInfo(logger, "Alvao computers loaded: " + computers.Count);
+
+        int matched = 0;
+        int updated = 0;
+        int unchanged = 0;
+        int notFound = 0;
+        int failed = 0;
+
+        var systemPerson = Person.GetSystem();
 
         foreach (var pc in computers)
         {
-            var key = StripDomain(pc.Hostname);
-            if (string.IsNullOrEmpty(key)) continue;
+            var key = Normalize(pc.Hostname);
+
+            if (string.IsNullOrEmpty(key))
+                continue;
 
             TvDevice tv;
-            if (!tvByHost.TryGetValue(key, out tv))
+
+            if (!tvDevices.TryGetValue(key, out tv))
             {
                 notFound++;
+
+                if (Settings.EnableDetailedNotFoundLogging)
+                {
+                    LogInfo(logger,
+                        "NOT FOUND: NodeId=" + pc.NodeId +
+                        " ClassId=" + pc.ClassId +
+                        " Hostname='" + pc.Hostname +
+                        "' Key='" + key + "'");
+                }
+
                 continue;
             }
 
-            var newVal = tv.TeamviewerId.ToString();
-            if (string.Equals(pc.CurrentTeamviewerId, newVal, StringComparison.Ordinal))
+            matched++;
+
+            var newValue = tv.TeamviewerId.ToString();
+
+            if (string.Equals(pc.CurrentTeamviewerId, newValue, StringComparison.Ordinal))
             {
                 unchanged++;
                 continue;
             }
 
-            if (dryRun)
+            if (Settings.DryRun)
             {
-                LogInfo(logger, "[DRY-RUN] NodeId=" + pc.NodeId + " Hostname=" + pc.Hostname
-                    + " TeamviewerId: '" + (pc.CurrentTeamviewerId ?? "") + "' -&gt; '" + newVal + "'"
-                    + " (tv last_seen=" + (tv.LastSeen.HasValue ? tv.LastSeen.Value.ToString("u") : "n/a") + ")");
                 updated++;
+
+                LogInfo(logger,
+                    "[DRY-RUN] NodeId=" + pc.NodeId +
+                    " Hostname='" + pc.Hostname + "'" +
+                    " TeamViewerName='" + tv.OriginalName + "'" +
+                    " TeamViewerId: '" + (pc.CurrentTeamviewerId ?? "") + "' -> '" + newValue + "'");
+                continue;
             }
-            else
+
+            try
             {
-                try
+                var props = new Dictionary<string, object>
                 {
-                    var props = new Dictionary&lt;string, object&gt; { { Settings.PropertyKey, newVal } };
-                    ObjectProperty.Update(systemPerson.iPersonId, pc.NodeId, props);
-                    updated++;
-                    LogInfo(logger, "TeamViewerImport: Updated NodeId=" + pc.NodeId + " Hostname=" + pc.Hostname + " TeamviewerId='" + newVal + "'");
-                }
-                catch (Exception ex)
-                {
-                    failed++;
-                    logger.Error(ex, "TeamViewerImport: Failed to update NodeId=" + pc.NodeId + " Hostname=" + pc.Hostname + ": " + ex.Message);
-                }
+                    { Settings.PropertyKey, newValue }
+                };
+
+                ObjectProperty.Update(systemPerson.iPersonId, pc.NodeId, props);
+
+                updated++;
+
+                LogInfo(logger,
+                    "UPDATED: NodeId=" + pc.NodeId +
+                    " Hostname='" + pc.Hostname + "'" +
+                    " Property='" + Settings.PropertyKey + "'" +
+                    " Value='" + newValue + "'" +
+                    " TeamViewerName='" + tv.OriginalName + "'");
+            }
+            catch (Exception ex)
+            {
+                failed++;
+
+                logger.Error(ex,
+                    "TeamViewerImport: Failed to update NodeId=" + pc.NodeId +
+                    " Hostname='" + pc.Hostname + "': " + ex.Message);
             }
         }
 
         stopwatch.Stop();
-        LogInfo(logger, "TeamViewerImport: Done in " + stopwatch.Elapsed.TotalSeconds.ToString("F1") + "s."
-            + " Updated=" + updated + ", Unchanged=" + unchanged + ", NotFound=" + notFound + ", Failed=" + failed
-            + ", DryRun=" + dryRun);
+
+        LogInfo(logger,
+            "Done in " + stopwatch.Elapsed.TotalSeconds.ToString("F1") + "s." +
+            " Matched=" + matched +
+            ", Updated=" + updated +
+            ", Unchanged=" + unchanged +
+            ", NotFound=" + notFound +
+            ", Failed=" + failed +
+            ", DryRun=" + Settings.DryRun);
     }
 
-    private static void LogInfo(NLog.ILogger logger, string message)
+    private static Dictionary<string, TvDevice> LoadTeamViewerDevices(NLog.ILogger logger)
     {
-        bool enabled = Settings.EnableLogging;
-        if (enabled) logger.Info(message);
-    }
-
-    private static string StripDomain(string hostname)
-    {
-        if (string.IsNullOrWhiteSpace(hostname)) return null;
-        var h = hostname.Trim().ToLowerInvariant();
-        var dot = h.IndexOf('.');
-        return dot &gt; 0 ? h.Substring(0, dot) : h;
-    }
-
-    private static Dictionary&lt;string, TvDevice&gt; LoadTeamViewerDevices(NLog.ILogger logger)
-    {
-        var result = new Dictionary&lt;string, TvDevice&gt;(StringComparer.OrdinalIgnoreCase);
+        var result = new Dictionary<string, TvDevice>(StringComparer.OrdinalIgnoreCase);
 
         using (var client = new HttpClient())
         {
             client.Timeout = TimeSpan.FromSeconds(60);
-            client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", Settings.ApiToken);
+            client.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", Settings.ApiToken);
 
-            int managedCount = 0;
-            string url = Settings.ApiBase + "/managed/devices";
-            int safety = 0;
-            while (!string.IsNullOrEmpty(url) &amp;&amp; safety++ &lt; 200)
-            {
-                var obj = GetJson(client, url);
-                if (obj == null) break;
-                var resources = obj["resources"] as JArray;
-                if (resources != null)
-                {
-                    foreach (var d in resources)
-                    {
-                        var name = (string)d["name"];
-                        var tvId = (long?)d["teamviewerId"];
-                        var lastSeen = (DateTime?)d["last_seen"];
-                        if (!string.IsNullOrEmpty(name) &amp;&amp; tvId.HasValue)
-                        {
-                            Merge(result, name, tvId.Value, lastSeen);
-                            managedCount++;
-                        }
-                    }
-                }
-                var nextToken = (string)obj["nextPaginationToken"];
-                url = string.IsNullOrWhiteSpace(nextToken)
-                    ? null
-                    : Settings.ApiBase + "/managed/devices?paginationToken=" + Uri.EscapeDataString(nextToken);
-            }
-            LogInfo(logger, "TeamViewerImport: Managed devices scanned=" + managedCount);
-
-            int legacyCount = 0;
-            var legacy = GetJson(client, Settings.ApiBase + "/devices");
-            var devices = legacy == null ? null : legacy["devices"] as JArray;
-            if (devices != null)
-            {
-                foreach (var d in devices)
-                {
-                    var alias = (string)d["alias"];
-                    var tvId = (long?)d["teamviewer_id"];
-                    if (!string.IsNullOrEmpty(alias) &amp;&amp; tvId.HasValue)
-                    {
-                        Merge(result, alias, tvId.Value, null);
-                        legacyCount++;
-                    }
-                }
-            }
-            LogInfo(logger, "TeamViewerImport: Legacy devices scanned=" + legacyCount);
+            LoadManagedDevices(client, result, logger);
+            LoadLegacyDevices(client, result, logger);
         }
 
         return result;
     }
 
-    private static void Merge(Dictionary&lt;string, TvDevice&gt; dict, string hostname, long tvId, DateTime? lastSeen)
+    private static void LoadManagedDevices(HttpClient client, Dictionary<string, TvDevice> result, NLog.ILogger logger)
     {
-        var key = StripDomain(hostname);
-        if (string.IsNullOrEmpty(key)) return;
+        int count = 0;
+        string url = Settings.ApiBase + "/managed/devices";
+        int safety = 0;
 
-        TvDevice existing;
-        if (dict.TryGetValue(key, out existing))
+        while (!string.IsNullOrEmpty(url) && safety++ < 200)
         {
-            var existingTs = existing.LastSeen ?? DateTime.MinValue;
-            var newTs = lastSeen ?? DateTime.MinValue;
-            if (newTs &gt; existingTs)
+            var obj = GetJson(client, url);
+            var resources = obj["resources"] as JArray;
+
+            if (resources != null)
             {
-                dict[key] = new TvDevice { TeamviewerId = tvId, LastSeen = lastSeen };
+                foreach (var d in resources)
+                {
+                    var name = (string)d["name"];
+                    var tvId = (long?)d["teamviewerId"];
+                    var lastSeen = (DateTime?)d["last_seen"];
+                    var isOnline = (bool?)d["isOnline"] ?? false;
+
+                    if (!string.IsNullOrWhiteSpace(name) && tvId.HasValue)
+                    {
+                        Merge(result, name, tvId.Value, lastSeen, isOnline, "managed");
+                        count++;
+                    }
+                }
+            }
+
+            var nextToken = (string)obj["nextPaginationToken"];
+
+            url = string.IsNullOrWhiteSpace(nextToken)
+                ? null
+                : Settings.ApiBase + "/managed/devices?paginationToken=" + Uri.EscapeDataString(nextToken);
+        }
+
+        LogInfo(logger, "Managed devices scanned: " + count);
+    }
+
+    private static void LoadLegacyDevices(HttpClient client, Dictionary<string, TvDevice> result, NLog.ILogger logger)
+    {
+        int count = 0;
+
+        var obj = GetJson(client, Settings.ApiBase + "/devices?full_list=true");
+        var devices = obj["devices"] as JArray;
+
+        if (devices != null)
+        {
+            foreach (var d in devices)
+            {
+                var alias = (string)d["alias"];
+                var tvId = (long?)d["teamviewer_id"];
+                var lastSeen = (DateTime?)d["last_seen"];
+
+                var onlineState = ((string)d["online_state"]) ?? "";
+                bool isOnline = onlineState.Equals("online", StringComparison.OrdinalIgnoreCase);
+
+                if (!string.IsNullOrWhiteSpace(alias) && tvId.HasValue)
+                {
+                    Merge(result, alias, tvId.Value, lastSeen, isOnline, "legacy");
+                    count++;
+                }
             }
         }
-        else
+
+        LogInfo(logger, "Legacy devices scanned: " + count);
+    }
+
+    private static void Merge(
+        Dictionary<string, TvDevice> dict,
+        string originalName,
+        long tvId,
+        DateTime? lastSeen,
+        bool isOnline,
+        string source)
+    {
+        var key = Normalize(originalName);
+
+        if (string.IsNullOrEmpty(key))
+            return;
+
+        var candidate = new TvDevice
         {
-            dict[key] = new TvDevice { TeamviewerId = tvId, LastSeen = lastSeen };
+            TeamviewerId = tvId,
+            LastSeen = lastSeen,
+            IsOnline = isOnline,
+            OriginalName = originalName,
+            Source = source
+        };
+
+        TvDevice existing;
+
+        if (!dict.TryGetValue(key, out existing))
+        {
+            dict[key] = candidate;
+            return;
         }
+
+        if (IsBetterCandidate(candidate, existing))
+            dict[key] = candidate;
+    }
+
+    private static bool IsBetterCandidate(TvDevice candidate, TvDevice existing)
+    {
+        if (candidate.IsOnline && !existing.IsOnline)
+            return true;
+
+        if (!candidate.IsOnline && existing.IsOnline)
+            return false;
+
+        var candidateTs = candidate.LastSeen ?? DateTime.MinValue;
+        var existingTs = existing.LastSeen ?? DateTime.MinValue;
+
+        if (candidateTs > existingTs)
+            return true;
+
+        if (candidateTs < existingTs)
+            return false;
+
+        if (candidate.Source == "managed" && existing.Source != "managed")
+            return true;
+
+        return false;
     }
 
     private static JObject GetJson(HttpClient client, string url)
@@ -261,15 +357,44 @@ public class TeamViewerImportPeriodicAction : IPeriodicAction
         {
             var resp = client.SendAsync(req).Result;
             var body = resp.Content.ReadAsStringAsync().Result;
+
             if (!resp.IsSuccessStatusCode)
                 throw new Exception("HTTP " + (int)resp.StatusCode + " from " + url + ": " + body);
+
             return JObject.Parse(body);
         }
+    }
+
+    private static string Normalize(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+            return null;
+
+        var x = value.Trim().ToLowerInvariant();
+
+        var dot = x.IndexOf('.');
+        if (dot > 0)
+            x = x.Substring(0, dot);
+
+        var dash = x.IndexOf(" - ");
+        if (dash > 0)
+            x = x.Substring(0, dash);
+
+        x = x.Trim();
+
+        return string.IsNullOrWhiteSpace(x) ? null : x;
+    }
+
+    private static void LogInfo(NLog.ILogger logger, string message)
+    {
+        if (Settings.EnableLogging)
+            logger.Info("TeamViewerImport: " + message);
     }
 
     private class AlvaoComputer
     {
         public int NodeId { get; set; }
+        public int ClassId { get; set; }
         public string Hostname { get; set; }
         public string CurrentTeamviewerId { get; set; }
     }
@@ -278,8 +403,12 @@ public class TeamViewerImportPeriodicAction : IPeriodicAction
     {
         public long TeamviewerId { get; set; }
         public DateTime? LastSeen { get; set; }
+        public bool IsOnline { get; set; }
+        public string OriginalName { get; set; }
+        public string Source { get; set; }
     }
-}</Code>
+}
+          ]]></Code>
           <IsLibCode>false</IsLibCode>
         </Script>
       </Scripts>
